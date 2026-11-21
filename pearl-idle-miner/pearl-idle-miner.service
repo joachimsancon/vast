@@ -1,0 +1,17 @@
+[Unit]
+Description=Mine Pearl (SRBMiner) on host only while Vast is not using the GPUs
+After=docker.service nvidia-persistenced.service network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/pearl-idle-miner
+ExecStopPost=-/usr/bin/pkill -KILL -x SRBMiner-MULTI
+ExecStopPost=-/usr/bin/nvidia-smi -rgc
+ExecStopPost=-/usr/bin/nvidia-smi -rmc
+KillMode=control-group
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

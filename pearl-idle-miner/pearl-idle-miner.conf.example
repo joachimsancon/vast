@@ -1,0 +1,29 @@
+# /etc/pearl-idle-miner.conf – configuration for pearl-idle-miner
+# Changes to LGC/LMC are picked up live (within ~2 s). Other values need: systemctl restart pearl-idle-miner
+
+# Your Kryptex (or other pool) account / wallet. REQUIRED.
+WALLET="krxXXXXXXX"
+
+# Worker name shown at the pool will be  WALLET.WORKER_SUFFIX  (multi-GPU hosts add -gpuN)
+WORKER_SUFFIX="$(hostname)"
+
+# Pool (Kryptex EU by default)
+POOL="stratum+tcp://prl-eu.kryptex.network:7048"
+
+# Unprivileged user that runs SRBMiner (created by install.sh)
+RUNAS="pearlminer"
+
+# Seconds the host must be completely idle (no containers, no other GPU processes) before mining starts
+IDLE_SEC=20
+
+# all    = mine only when ALL GPUs are idle (recommended – never share a host with a renter)
+# pergpu = mine on every idle GPU, even if another GPU on the host is rented
+MODE=all
+
+# Locked GPU core clock (MHz) and memory clock (MHz) while mining. See README for tested values.
+LGC=2100
+LMC=810
+
+# Optional per-GPU overrides (index from nvidia-smi):
+# LGC_0=2100
+# LGC_1=1100

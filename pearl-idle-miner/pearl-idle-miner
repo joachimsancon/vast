@@ -1,0 +1,152 @@
+#!/bin/bash
+# pearl-idle-miner – mine Pearl (PRL) with SRBMiner-Multi on Vast.ai hosts ONLY while the GPUs are idle.
+#
+# * Starts one SRBMiner instance per GPU when no container has run and no other GPU process has
+#   been seen for $IDLE_SEC seconds.
+# * On ANY "docker create/start" (a renter, or one of Vast's own tests) all miners are killed
+#   (SIGKILL) and GPU clocks are reset immediately – typically within ~0.3 s, before the renter's
+#   container starts using the GPU.
+# * Locks GPU core/memory clocks only while its own miner is running (efficiency tuning).
+# * Downloads the latest SRBMiner-Multi release from GitHub and verifies its SHA256 against the
+#   digest published by GitHub (checked at most every 6 hours).
+#
+# Configuration: /etc/pearl-idle-miner.conf (see pearl-idle-miner.conf.example)
+# Runs as root (needs nvidia-smi clock control); the miner itself runs as $RUNAS.
+# License: MIT. Use at your own risk – check your marketplace's terms of service.
+set -u
+CONF=${CONF:-/etc/pearl-idle-miner.conf}
+# defaults (override in $CONF)
+WALLET=""; POOL="stratum+tcp://prl-eu.kryptex.network:7048"; WORKER_SUFFIX="$(hostname)"
+RUNAS="pearlminer"; IDLE_SEC=20; MODE=all; LGC=2100; LMC=810
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+[ -n "$WALLET" ] || { echo "pearl-idle-miner: set WALLET in $CONF" >&2; exit 1; }
+WORKER="${WALLET}.${WORKER_SUFFIX}"
+DIR=/opt/srbminer
+LOG() { logger -t pearl-idle-miner "$*"; }
+mlog() { echo "/var/log/srbminer-gpu$1.log"; }
+mark() { echo "[$(date "+%F %T")] ===== $2 =====" >> "$(mlog "$1")"; }
+
+mapfile -t GPUS < <(nvidia-smi --query-gpu=index --format=csv,noheader)
+declare -A UUID2IDX BUS2IDX MPID LOCKED
+while IFS=', ' read -r i u b; do UUID2IDX[$u]=$i; BUS2IDX[${b,,}]=$i; done \
+    < <(nvidia-smi --query-gpu=index,uuid,pci.bus_id --format=csv,noheader)
+for g in "${GPUS[@]}"; do MPID[$g]=""; LOCKED[$g]=0; done
+IDLE_SINCE=$(date +%s)
+
+conf_val() {  # $1=LGC|LMC $2=gpu $3=default – per-GPU value (LGC_0=...) overrides the global one; re-read every time
+    local v=""
+    [ -r "$CONF" ] && v=$(sed -n "s/^$1_$2=\([0-9]\{3,5\}\)$/\1/p" "$CONF" | tail -1)
+    [ -z "$v" ] && [ -r "$CONF" ] && v=$(sed -n "s/^$1=\([0-9]\{3,5\}\)$/\1/p" "$CONF" | tail -1)
+    if [ -n "$v" ] && [ "$v" -ge 210 ] && [ "$v" -le 12000 ]; then echo "$v"; else echo "$3"; fi
+}
+reset_clocks() { nvidia-smi -i "$1" -rgc >/dev/null 2>&1; nvidia-smi -i "$1" -rmc >/dev/null 2>&1; LOCKED[$1]=0; }
+lock_clocks() {
+    local g=$1 lgc lmc; lgc=$(conf_val LGC "$g" "$LGC"); lmc=$(conf_val LMC "$g" "$LMC")
+    [ "${LOCKED[$g]}" = "$lgc $lmc" ] && return
+    nvidia-smi -i "$g" -lgc "$lgc" >/dev/null 2>&1 && nvidia-smi -i "$g" -lmc "$lmc" >/dev/null 2>&1 && LOCKED[$g]="$lgc $lmc"
+}
+stop_all() {  # $1 = reason
+    pkill -KILL -x SRBMiner-MULTI 2>/dev/null
+    local g any=0
+    for g in "${GPUS[@]}"; do
+        reset_clocks "$g"
+        if [ -n "${MPID[$g]}" ]; then mark "$g" "MINER STOPPED: $1"; MPID[$g]=""; any=1; fi
+    done
+    [ $any = 1 ] && LOG "stop all ($1)"
+    IDLE_SINCE=$(date +%s)
+}
+stop_gpu() {  # $1=gpu $2=reason
+    local g=$1
+    [ -n "${MPID[$g]}" ] && kill -KILL "${MPID[$g]}" 2>/dev/null
+    pkill -KILL -f -- "SRBMiner-MULTI .*--gpu-id $g( |$)" 2>/dev/null
+    reset_clocks "$g"
+    if [ -n "${MPID[$g]}" ]; then mark "$g" "MINER STOPPED: $2"; LOG "stop gpu$g ($2)"; MPID[$g]=""; fi
+}
+
+update_miner() {
+    [ -x "$DIR/current/SRBMiner-MULTI" ] && [ -n "$(find "$DIR/.checked" -mmin -360 2>/dev/null)" ] && return 0
+    local j u s d
+    j=$(curl -fsSL --max-time 30 https://api.github.com/repos/doktor83/SRBMiner-Multi/releases/latest | tr ',' '\n') || return 0
+    u=$(echo "$j" | grep -o 'https://[^"]*-Linux\.tar\.gz' | head -1)
+    s=$(echo "$j" | awk '/"name": *"[^"]*-Linux\.tar\.gz"/{f=1} f&&/"digest"/{sub(/.*sha256:/,"");gsub(/[" ]/,"");print;exit}')
+    [ -n "$u" ] && [ -n "$s" ] || return 0
+    mkdir -p "$DIR"; touch "$DIR/.checked"
+    d=$(basename "$u" -Linux.tar.gz)
+    [ -x "$DIR/$d/SRBMiner-MULTI" ] && { ln -sfn "$DIR/$d" "$DIR/current"; return 0; }
+    curl -fsSL --max-time 300 -o "$DIR/dl.tgz" "$u" || return 0
+    echo "$s  $DIR/dl.tgz" | sha256sum -c --quiet || { LOG "checksum mismatch $u"; rm -f "$DIR/dl.tgz"; return 0; }
+    tar -xzf "$DIR/dl.tgz" -C "$DIR" && ln -sfn "$DIR/$d" "$DIR/current" && rm -f "$DIR/dl.tgz" && LOG "installed $d"
+}
+start_gpu() {
+    local g=$1 l; l=$(mlog "$g")
+    update_miner
+    [ -x "$DIR/current/SRBMiner-MULTI" ] || { LOG "no SRBMiner available"; return; }
+    touch "$l"; cat "$l" >> "$l.history"; tail -c 20000000 "$l.history" > "$l.history.tmp" && mv "$l.history.tmp" "$l.history"
+    chown "$RUNAS" "$l"
+    local w=$WORKER; [ "${#GPUS[@]}" -gt 1 ] && w="$WORKER-gpu$g"
+    ( cd "$DIR/current" && exec runuser -u "$RUNAS" -- ./SRBMiner-MULTI --algorithm pearlhash --disable-cpu --gpu-id "$g" \
+        --pool "$POOL" --wallet "$w" --api-enable --api-port $((21550 + g)) --log-file "$l" >/dev/null 2>&1 </dev/null ) &
+    MPID[$g]=$!
+    LOG "start gpu$g (pid ${MPID[$g]}, $(basename "$(readlink -f "$DIR/current")"), worker $w)"
+}
+
+busy_gpus() {  # print indices of GPUs used by anything other than our miners
+    local c v x
+    for c in $(docker ps -q 2>/dev/null); do
+        v=$(docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^NVIDIA_VISIBLE_DEVICES=//p' | tail -1)
+        case "$v" in
+            void|none) ;;
+            ""|all) printf '%s\n' "${GPUS[@]}" ;;
+            *) for x in ${v//,/ }; do
+                   if [[ $x =~ ^[0-9]+$ ]]; then echo "$x"
+                   elif [ -n "${UUID2IDX[$x]:-}" ]; then echo "${UUID2IDX[$x]}"
+                   else printf '%s\n' "${GPUS[@]}"; fi
+               done ;;
+        esac
+    done
+    nvidia-smi --query-compute-apps=gpu_bus_id,process_name --format=csv,noheader 2>/dev/null | while IFS=',' read -r b p; do
+        b=$(echo "$b" | xargs); p=$(echo "$p" | xargs); p=${p##*/}
+        case "$b $p" in *"No data"*|*"No running processes"*|*"Not Supported"*) continue ;; esac
+        case "$p" in ""|SRBMiner-MULTI) continue ;; esac
+        [ -n "${BUS2IDX[${b,,}]:-}" ] && echo "${BUS2IDX[${b,,}]}" || printf '%s\n' "${GPUS[@]}"
+    done
+}
+
+cleanup() { kill "$EVPID" 2>/dev/null; stop_all "service stop"; exit 0; }
+trap cleanup TERM INT
+
+stop_all "service start"
+LOG "GPUs: ${GPUS[*]}, worker $WORKER"
+
+# Fast path: any docker create/start kills all miners and resets all clocks immediately.
+( docker events --filter type=container --filter event=create --filter event=start --format '{{.Action}} {{.Actor.Attributes.name}}' \
+  | while read -r ev name; do
+        pkill -KILL -x SRBMiner-MULTI 2>/dev/null
+        for g in "${GPUS[@]}"; do
+            nvidia-smi -i "$g" -rgc >/dev/null 2>&1; nvidia-smi -i "$g" -rmc >/dev/null 2>&1
+            echo "[$(date "+%F %T")] ===== MINER STOPPED: docker $ev $name (clocks reset) =====" >> "/var/log/srbminer-gpu$g.log"
+        done
+        logger -t pearl-idle-miner "docker $ev $name -> all miners stopped, clocks reset"
+    done ) &
+EVPID=$!
+
+while true; do
+    now=$(date +%s)
+    mapfile -t BUSY < <(busy_gpus | sort -u)
+    if [ "$MODE" = all ] && [ -n "${BUSY[*]}" ]; then BUSY=("${GPUS[@]}"); fi
+    for g in "${GPUS[@]}"; do
+        if [ -n "${MPID[$g]}" ] && ! kill -0 "${MPID[$g]}" 2>/dev/null; then MPID[$g]=""; reset_clocks "$g"; IDLE_SINCE=$now; fi
+    done
+    for g in "${GPUS[@]}"; do
+        if printf '%s\n' "${BUSY[@]}" | grep -qx "$g"; then
+            if [ -n "${MPID[$g]}" ] || [ "${LOCKED[$g]}" != 0 ]; then stop_gpu "$g" "GPU in use by Vast/renter"; fi
+        elif [ -z "${MPID[$g]}" ]; then
+            [ $((now - IDLE_SINCE)) -ge "$IDLE_SEC" ] && start_gpu "$g"
+        else
+            lock_clocks "$g"
+        fi
+    done
+    kill -0 "$EVPID" 2>/dev/null || { LOG "docker events died"; stop_all "events died"; exit 1; }
+    sleep 2
+done
