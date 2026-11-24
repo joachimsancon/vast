@@ -52,9 +52,27 @@ Notes: on RTX 50-series the memory clock lock made no measurable power differenc
 are not worth it for Pearl. Change `LGC`/`LMC` in the config – it is picked up live.
 
 ## How it decides a GPU is busy
-A GPU is busy if a running container has it in `NVIDIA_VISIBLE_DEVICES` (index, UUID or `all`), or if
-any process other than SRBMiner is using it (`nvidia-smi --query-compute-apps`). Nothing else from the
-renter's container is read.
+Vast starts every rental container with the NVIDIA runtime and `NVIDIA_VISIBLE_DEVICES` set to the GPU
+index(es) the renter got – e.g. `1` for a 1-GPU rental on GPU 1, `0,1` for a 2-GPU rental.
+
+A GPU counts as **busy** if any of these is true:
+1. A container that is running, created, restarting or paused has it in `NVIDIA_VISIBLE_DEVICES`
+   (index or UUID). `all`, an empty value or anything unrecognised marks **every** GPU busy.
+2. A process other than SRBMiner uses it (`nvidia-smi --query-compute-apps`, matched by PCI bus id).
+3. More than `VRAM_BUSY_MIB` (default 100) MiB of its memory is in use while our miner is not running on it.
+
+Extra safety:
+- **Any** `docker create/start` still kills **all** miners and resets **all** clocks immediately,
+  also in `MODE=pergpu`. Idle GPUs are only restarted after `IDLE_SEC` seconds without new events.
+- SRBMiner runs with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so `--gpu-id N` is the same GPU as `nvidia-smi -i N`
+  (CUDA's default ordering is "fastest first" and can differ from nvidia-smi).
+- A guard checks every 2 s which GPU each SRBMiner process is actually running on (by PCI bus id).
+  If one is on a GPU it was not started on, or on a busy GPU, all miners are stopped and it is logged.
+
+Nothing else from the renter's container is read (only `NVIDIA_VISIBLE_DEVICES`).
+
+`MODE=pergpu` (mine on the idle GPU of a partly rented host) is newer than `MODE=all` – test it on one
+host and watch `journalctl -t pearl-idle-miner` before rolling it out.
 
 ## Disclaimer
 Use at your own risk. Check the terms of service of your marketplace before mining on hosted hardware.

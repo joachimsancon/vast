@@ -6,6 +6,12 @@
 # * On ANY "docker create/start" (a renter, or one of Vast's own tests) all miners are killed
 #   (SIGKILL) and GPU clocks are reset immediately – typically within ~0.3 s, before the renter's
 #   container starts using the GPU.
+# * A GPU counts as busy if a container (running, created, restarting or paused) has it in
+#   NVIDIA_VISIBLE_DEVICES ("all", empty or unknown values = every GPU), if another process uses it,
+#   or if more than $VRAM_BUSY_MIB MiB of its memory is in use while our miner is not running on it.
+# * Guard: if an SRBMiner process ever shows up on a GPU it was not started on, or on a busy GPU,
+#   all miners are stopped immediately. SRBMiner runs with CUDA_DEVICE_ORDER=PCI_BUS_ID so that
+#   --gpu-id N always means nvidia-smi index N.
 # * Locks GPU core/memory clocks only while its own miner is running (efficiency tuning).
 # * Downloads the latest SRBMiner-Multi release from GitHub and verifies its SHA256 against the
 #   digest published by GitHub (checked at most every 6 hours).
@@ -17,7 +23,7 @@ set -u
 CONF=${CONF:-/etc/pearl-idle-miner.conf}
 # defaults (override in $CONF)
 WALLET=""; POOL="stratum+tcp://prl-eu.kryptex.network:7048"; WORKER_SUFFIX="$(hostname)"
-RUNAS="pearlminer"; IDLE_SEC=20; MODE=all; LGC=2100; LMC=810
+RUNAS="pearlminer"; IDLE_SEC=20; MODE=all; LGC=2100; LMC=810; VRAM_BUSY_MIB=100
 # shellcheck disable=SC1090
 [ -r "$CONF" ] && . "$CONF"
 [ -n "$WALLET" ] || { echo "pearl-idle-miner: set WALLET in $CONF" >&2; exit 1; }
@@ -85,7 +91,7 @@ start_gpu() {
     touch "$l"; cat "$l" >> "$l.history"; tail -c 20000000 "$l.history" > "$l.history.tmp" && mv "$l.history.tmp" "$l.history"
     chown "$RUNAS" "$l"
     local w=$WORKER; [ "${#GPUS[@]}" -gt 1 ] && w="$WORKER-gpu$g"
-    ( cd "$DIR/current" && exec runuser -u "$RUNAS" -- ./SRBMiner-MULTI --algorithm pearlhash --disable-cpu --gpu-id "$g" \
+    ( cd "$DIR/current" && exec runuser -u "$RUNAS" -- env CUDA_DEVICE_ORDER=PCI_BUS_ID ./SRBMiner-MULTI --algorithm pearlhash --disable-cpu --gpu-id "$g" \
         --pool "$POOL" --wallet "$w" --api-enable --api-port $((21550 + g)) --log-file "$l" >/dev/null 2>&1 </dev/null ) &
     MPID[$g]=$!
     LOG "start gpu$g (pid ${MPID[$g]}, $(basename "$(readlink -f "$DIR/current")"), worker $w)"
@@ -93,7 +99,7 @@ start_gpu() {
 
 busy_gpus() {  # print indices of GPUs used by anything other than our miners
     local c v x
-    for c in $(docker ps -q 2>/dev/null); do
+    for c in $(docker ps -q --filter status=running --filter status=created --filter status=restarting --filter status=paused 2>/dev/null); do
         v=$(docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^NVIDIA_VISIBLE_DEVICES=//p' | tail -1)
         case "$v" in
             void|none) ;;
@@ -111,6 +117,24 @@ busy_gpus() {  # print indices of GPUs used by anything other than our miners
         case "$p" in ""|SRBMiner-MULTI) continue ;; esac
         [ -n "${BUS2IDX[${b,,}]:-}" ] && echo "${BUS2IDX[${b,,}]}" || printf '%s\n' "${GPUS[@]}"
     done
+    # memory in use on a GPU where our miner is not running = somebody else is using it
+    nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits 2>/dev/null | while IFS=', ' read -r i m; do
+        [ -n "${MPID[$i]:-}" ] && kill -0 "${MPID[$i]}" 2>/dev/null && continue
+        [ "${m:-0}" -gt "$VRAM_BUSY_MIB" ] 2>/dev/null && echo "$i"
+    done
+}
+
+wrong_gpu() {  # true if an SRBMiner runs on a GPU we did not start it on, or on a busy GPU
+    local b p i
+    while IFS=',' read -r b p; do
+        b=$(echo "$b" | xargs); p=$(echo "$p" | xargs); p=${p##*/}
+        [ "$p" = SRBMiner-MULTI ] || continue
+        i=${BUS2IDX[${b,,}]:-}
+        [ -z "$i" ] && return 0
+        [ -z "${MPID[$i]}" ] && return 0
+        printf '%s\n' "${BUSY[@]}" | grep -qx "$i" && return 0
+    done < <(nvidia-smi --query-compute-apps=gpu_bus_id,process_name --format=csv,noheader 2>/dev/null)
+    return 1
 }
 
 cleanup() { kill "$EVPID" 2>/dev/null; stop_all "service stop"; exit 0; }
@@ -147,6 +171,7 @@ while true; do
             lock_clocks "$g"
         fi
     done
+    if wrong_gpu; then stop_all "GUARD: SRBMiner on wrong or busy GPU"; LOG "GUARD triggered - check GPU mapping"; fi
     kill -0 "$EVPID" 2>/dev/null || { LOG "docker events died"; stop_all "events died"; exit 1; }
     sleep 2
 done

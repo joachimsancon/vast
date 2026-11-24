@@ -20,6 +20,9 @@ IDLE_SEC=20
 # pergpu = mine on every idle GPU, even if another GPU on the host is rented
 MODE=all
 
+# A GPU with more than this much memory in use (MiB) while our miner is not on it counts as busy
+VRAM_BUSY_MIB=100
+
 # Locked GPU core clock (MHz) and memory clock (MHz) while mining. See README for tested values.
 LGC=2100
 LMC=810
