@@ -72,6 +72,9 @@ stop_gpu() {  # $1=gpu $2=reason
 
 update_miner() {
     [ -x "$DIR/current/SRBMiner-MULTI" ] && [ -n "$(find "$DIR/.checked" -mmin -360 2>/dev/null)" ] && return 0
+    # at most one GitHub API attempt per 15 min (unauthenticated limit is 60/h per public IP, shared by all hosts)
+    [ -n "$(find "$DIR/.tried" -mmin -15 2>/dev/null)" ] && return 0
+    mkdir -p "$DIR"; touch "$DIR/.tried"
     local j u s d
     j=$(curl -fsSL --max-time 30 https://api.github.com/repos/doktor83/SRBMiner-Multi/releases/latest | tr ',' '\n') || return 0
     u=$(echo "$j" | grep -o 'https://[^"]*-Linux\.tar\.gz' | head -1)
