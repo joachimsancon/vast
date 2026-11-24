@@ -9,8 +9,10 @@
 # * A GPU counts as busy if a container (running, created, restarting or paused) has it in
 #   NVIDIA_VISIBLE_DEVICES ("all", empty or unknown values = every GPU), if another process uses it,
 #   or if more than $VRAM_BUSY_MIB MiB of its memory is in use while our miner is not running on it.
-# * Every GPU counts as busy if there are as many GPU containers as GPUs, or if two containers claim
-#   the same index (the index in NVIDIA_VISIBLE_DEVICES can point at the wrong physical GPU).
+# * Which GPU a container has is read from its cgroup v2 device filter (which /dev/nvidiaN it may open,
+#   via bpftool) – the index in NVIDIA_VISIBLE_DEVICES can point at the wrong physical GPU. If that
+#   cannot be decided, the env index is used and two containers claiming the same index = every GPU busy.
+# * Every GPU counts as busy if there are as many GPU containers as GPUs.
 # * Guard: if an SRBMiner process ever shows up on a GPU it was not started on, or on a busy GPU,
 #   all miners are stopped immediately. SRBMiner runs with CUDA_DEVICE_ORDER=PCI_BUS_ID so that
 #   --gpu-id N always means nvidia-smi index N.
@@ -40,6 +42,11 @@ declare -A UUID2IDX BUS2IDX MPID LOCKED
 while IFS=', ' read -r i u b; do UUID2IDX[$u]=$i; BUS2IDX[${b,,}]=$i; done \
     < <(nvidia-smi --query-gpu=index,uuid,pci.bus_id --format=csv,noheader)
 for g in "${GPUS[@]}"; do MPID[$g]=""; LOCKED[$g]=0; done
+declare -A MINOR2IDX   # /dev/nvidiaN (minor N) -> nvidia-smi index, via PCI bus id
+for d in /proc/driver/nvidia/gpus/*; do
+    mi=$(awk '/Device Minor/{print $3}' "$d/information" 2>/dev/null); b=$(basename "$d")
+    [ -n "$mi" ] && [ -n "${BUS2IDX[0000${b,,}]:-}" ] && MINOR2IDX[$mi]=${BUS2IDX[0000${b,,}]}
+done
 IDLE_SINCE=$(date +%s)
 
 conf_val() {  # $1=LGC|LMC $2=gpu $3=default – per-GPU value (LGC_0=...) overrides the global one; re-read every time
@@ -102,24 +109,43 @@ start_gpu() {
     LOG "start gpu$g (pid ${MPID[$g]}, $(basename "$(readlink -f "$DIR/current")"), worker $w)"
 }
 
-busy_gpus() {  # print indices of GPUs used by anything other than our miners
-    local c v x n=0 claims=""
-    for c in $(docker ps -q --filter status=running --filter status=created --filter status=restarting --filter status=paused 2>/dev/null); do
-        v=$(docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^NVIDIA_VISIBLE_DEVICES=//p' | tail -1)
-        case "$v" in
-            void|none) ;;
-            ""|all) printf '%s\n' "${GPUS[@]}" ;;
-            *) n=$((n + 1))
-               for x in ${v//,/ }; do
-                   if [[ $x =~ ^[0-9]+$ ]]; then echo "$x"; claims+="$x "
-                   elif [ -n "${UUID2IDX[$x]:-}" ]; then echo "${UUID2IDX[$x]}"; claims+="${UUID2IDX[$x]} "
-                   else printf '%s\n' "${GPUS[@]}"; fi
-               done ;;
-        esac
+cg_gpus() {  # $1=container id. Print the GPU indices the container is actually allowed to open (cgroup v2
+             # device filter, major 195 = /dev/nvidiaN). Returns 1 if this cannot be decided safely.
+    local id=$1 cg pid out m k=0
+    cg=/sys/fs/cgroup/docker/$id; [ -d "$cg" ] || cg=/sys/fs/cgroup/system.slice/docker-$id.scope
+    [ -d "$cg" ] && command -v bpftool >/dev/null || return 1
+    pid=$(bpftool cgroup list "$cg" 2>/dev/null | awk '/cgroup_device|device/{print $1; exit}')
+    [ -n "$pid" ] || return 1
+    out=$(bpftool prog dump xlated id "$pid" 2>/dev/null | awk '
+        /if r4 != 0xc3 goto/ {getline n; if (n ~ /if r5 != 0x[0-9a-f]+ goto/) {sub(/.*r5 != 0x/,"",n); sub(/ goto.*/,"",n); print n} else print "ALL"}')
+    [ -n "$out" ] || return 1
+    for m in $out; do
+        [ "$m" = ALL ] && return 1
+        m=$((16#$m)); [ "$m" -ge 254 ] && continue          # 254 nvidia-modeset, 255 nvidiactl
+        [ -n "${MINOR2IDX[$m]:-}" ] || return 1
+        echo "${MINOR2IDX[$m]}"; k=$((k + 1))
     done
-    # The index in NVIDIA_VISIBLE_DEVICES does not always match the physical GPU. As many GPU containers
-    # as GPUs, or two containers claiming the same index = treat every GPU as busy.
-    if [ "$n" -ge "${#GPUS[@]}" ] || [ -n "$(printf '%s\n' $claims | sort | uniq -d)" ]; then printf '%s\n' "${GPUS[@]}"; fi
+    [ "$k" -gt 0 ]                                           # no GPU found = not safe
+}
+
+busy_gpus() {  # print indices of GPUs used by anything other than our miners
+    local c v x n=0 claims="" fb=0
+    for c in $(docker ps -q --no-trunc --filter status=running --filter status=created --filter status=restarting --filter status=paused 2>/dev/null); do
+        v=$(docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^NVIDIA_VISIBLE_DEVICES=//p' | tail -1)
+        case "$v" in void|none) continue ;; ""|all) printf '%s\n' "${GPUS[@]}"; continue ;; esac
+        n=$((n + 1))
+        # 1) Ground truth: which /dev/nvidiaN the container may open (the env index can point at the wrong GPU)
+        if cg_gpus "$c"; then continue; fi
+        # 2) Fallback (e.g. a container that is only "created"): the env index, plus the duplicate rule below
+        fb=1
+        for x in ${v//,/ }; do
+            if [[ $x =~ ^[0-9]+$ ]]; then echo "$x"; claims+="$x "
+            elif [ -n "${UUID2IDX[$x]:-}" ]; then echo "${UUID2IDX[$x]}"; claims+="${UUID2IDX[$x]} "
+            else printf '%s\n' "${GPUS[@]}"; fi
+        done
+    done
+    # As many GPU containers as GPUs = all busy. In fallback: two containers claiming the same index = all busy.
+    if [ "$n" -ge "${#GPUS[@]}" ] || { [ "$fb" = 1 ] && [ -n "$(printf '%s\n' $claims | sort | uniq -d)" ]; }; then printf '%s\n' "${GPUS[@]}"; fi
     nvidia-smi --query-compute-apps=gpu_bus_id,process_name --format=csv,noheader 2>/dev/null | while IFS=',' read -r b p; do
         b=$(echo "$b" | xargs); p=$(echo "$p" | xargs); p=${p##*/}
         case "$b $p" in *"No data"*|*"No running processes"*|*"Not Supported"*) continue ;; esac
