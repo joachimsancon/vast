@@ -9,6 +9,8 @@
 # * A GPU counts as busy if a container (running, created, restarting or paused) has it in
 #   NVIDIA_VISIBLE_DEVICES ("all", empty or unknown values = every GPU), if another process uses it,
 #   or if more than $VRAM_BUSY_MIB MiB of its memory is in use while our miner is not running on it.
+# * Every GPU counts as busy if there are as many GPU containers as GPUs, or if two containers claim
+#   the same index (the index in NVIDIA_VISIBLE_DEVICES can point at the wrong physical GPU).
 # * Guard: if an SRBMiner process ever shows up on a GPU it was not started on, or on a busy GPU,
 #   all miners are stopped immediately. SRBMiner runs with CUDA_DEVICE_ORDER=PCI_BUS_ID so that
 #   --gpu-id N always means nvidia-smi index N.
@@ -101,19 +103,23 @@ start_gpu() {
 }
 
 busy_gpus() {  # print indices of GPUs used by anything other than our miners
-    local c v x
+    local c v x n=0 claims=""
     for c in $(docker ps -q --filter status=running --filter status=created --filter status=restarting --filter status=paused 2>/dev/null); do
         v=$(docker inspect "$c" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^NVIDIA_VISIBLE_DEVICES=//p' | tail -1)
         case "$v" in
             void|none) ;;
             ""|all) printf '%s\n' "${GPUS[@]}" ;;
-            *) for x in ${v//,/ }; do
-                   if [[ $x =~ ^[0-9]+$ ]]; then echo "$x"
-                   elif [ -n "${UUID2IDX[$x]:-}" ]; then echo "${UUID2IDX[$x]}"
+            *) n=$((n + 1))
+               for x in ${v//,/ }; do
+                   if [[ $x =~ ^[0-9]+$ ]]; then echo "$x"; claims+="$x "
+                   elif [ -n "${UUID2IDX[$x]:-}" ]; then echo "${UUID2IDX[$x]}"; claims+="${UUID2IDX[$x]} "
                    else printf '%s\n' "${GPUS[@]}"; fi
                done ;;
         esac
     done
+    # The index in NVIDIA_VISIBLE_DEVICES does not always match the physical GPU. As many GPU containers
+    # as GPUs, or two containers claiming the same index = treat every GPU as busy.
+    if [ "$n" -ge "${#GPUS[@]}" ] || [ -n "$(printf '%s\n' $claims | sort | uniq -d)" ]; then printf '%s\n' "${GPUS[@]}"; fi
     nvidia-smi --query-compute-apps=gpu_bus_id,process_name --format=csv,noheader 2>/dev/null | while IFS=',' read -r b p; do
         b=$(echo "$b" | xargs); p=$(echo "$p" | xargs); p=${p##*/}
         case "$b $p" in *"No data"*|*"No running processes"*|*"Not Supported"*) continue ;; esac

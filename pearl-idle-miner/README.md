@@ -60,6 +60,13 @@ A GPU counts as **busy** if any of these is true:
    (index or UUID). `all`, an empty value or anything unrecognised marks **every** GPU busy.
 2. A process other than SRBMiner uses it (`nvidia-smi --query-compute-apps`, matched by PCI bus id).
 3. More than `VRAM_BUSY_MIB` (default 100) MiB of its memory is in use while our miner is not running on it.
+4. **Every** GPU counts as busy if there are as many GPU containers as GPUs, or if two containers claim
+   the same index.
+
+Why rule 4: the index in `NVIDIA_VISIBLE_DEVICES` does not always match the physical GPU. On two 2-GPU
+hosts we saw a container with `NVIDIA_VISIBLE_DEVICES=1` actually running on the GPU that `nvidia-smi`
+calls 0 – and on one of them two containers both claimed index `1`. An idle renter uses no VRAM, so
+rules 1–3 cannot see which card is really theirs; rule 4 then refuses to mine at all.
 
 Extra safety:
 - **Any** `docker create/start` still kills **all** miners and resets **all** clocks immediately,
@@ -71,8 +78,8 @@ Extra safety:
 
 Nothing else from the renter's container is read (only `NVIDIA_VISIBLE_DEVICES`).
 
-`MODE=pergpu` (mine on the idle GPU of a partly rented host) is newer than `MODE=all` – test it on one
-host and watch `journalctl -t pearl-idle-miner` before rolling it out.
+`MODE=pergpu` (mine on the idle GPU of a partly rented host) now runs on 17 hosts. It is still not the
+default – test it on one host and watch `journalctl -t pearl-idle-miner` before rolling it out.
 
 ## Disclaimer
 Use at your own risk. Check the terms of service of your marketplace before mining on hosted hardware.
