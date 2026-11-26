@@ -16,6 +16,10 @@
 # * Guard: if an SRBMiner process ever shows up on a GPU it was not started on, or on a busy GPU,
 #   all miners are stopped immediately. SRBMiner runs with CUDA_DEVICE_ORDER=PCI_BUS_ID so that
 #   --gpu-id N always means nvidia-smi index N.
+# * When one of Vast's own test containers (image vastai/test*) is destroyed, idle GPUs restart right away
+#   instead of after $IDLE_SEC s. Vast runs its bandwidth test up to ~13 times an hour on idle machines
+#   (~5 s each), so waiting cost several percent of mining time. Any new create/start still stops everything.
+# * If SRBMiner exits on its own, the exit code and its last log line are written to the journal.
 # * Locks GPU core/memory clocks only while its own miner is running (efficiency tuning).
 # * Downloads the latest SRBMiner-Multi release from GitHub and verifies its SHA256 against the
 #   digest published by GitHub (checked at most every 6 hours).
@@ -33,6 +37,7 @@ RUNAS="pearlminer"; IDLE_SEC=20; MODE=all; LGC=2100; LMC=810; VRAM_BUSY_MIB=100
 [ -n "$WALLET" ] || { echo "pearl-idle-miner: set WALLET in $CONF" >&2; exit 1; }
 WORKER="${WALLET}.${WORKER_SUFFIX}"
 DIR=/opt/srbminer
+FAST=/run/pearl-idle-miner.fast   # set by the event loop when a Vast test container has finished
 LOG() { logger -t pearl-idle-miner "$*"; }
 mlog() { echo "/var/log/srbminer-gpu$1.log"; }
 mark() { echo "[$(date "+%F %T")] ===== $2 =====" >> "$(mlog "$1")"; }
@@ -179,8 +184,14 @@ stop_all "service start"
 LOG "GPUs: ${GPUS[*]}, worker $WORKER"
 
 # Fast path: any docker create/start kills all miners and resets all clocks immediately.
-( docker events --filter type=container --filter event=create --filter event=start --format '{{.Action}} {{.Actor.Attributes.name}}' \
-  | while read -r ev name; do
+( docker events --filter type=container --filter event=create --filter event=start --filter event=destroy \
+      --format '{{.Action}} {{.Actor.Attributes.name}} {{.Actor.Attributes.image}}' \
+  | while read -r ev name image; do
+        if [ "$ev" = destroy ]; then
+            case "$image" in vastai/test*) touch "$FAST"; logger -t pearl-idle-miner "Vast test $name finished -> fast restart" ;; esac
+            continue
+        fi
+        rm -f "$FAST"
         pkill -KILL -x SRBMiner-MULTI 2>/dev/null
         for g in "${GPUS[@]}"; do
             nvidia-smi -i "$g" -rgc >/dev/null 2>&1; nvidia-smi -i "$g" -rmc >/dev/null 2>&1
@@ -195,8 +206,13 @@ while true; do
     mapfile -t BUSY < <(busy_gpus | sort -u)
     if [ "$MODE" = all ] && [ -n "${BUSY[*]}" ]; then BUSY=("${GPUS[@]}"); fi
     for g in "${GPUS[@]}"; do
-        if [ -n "${MPID[$g]}" ] && ! kill -0 "${MPID[$g]}" 2>/dev/null; then MPID[$g]=""; reset_clocks "$g"; IDLE_SINCE=$now; fi
+        if [ -n "${MPID[$g]}" ] && ! kill -0 "${MPID[$g]}" 2>/dev/null; then
+            wait "${MPID[$g]}" 2>/dev/null; rc=$?
+            [ "$rc" -ne 137 ] && LOG "gpu$g: SRBMiner exited on its own (rc=$rc): $(grep -v '^\[.*hashrate' "$(mlog "$g")" 2>/dev/null | tail -1 | cut -c1-150)"
+            MPID[$g]=""; reset_clocks "$g"; IDLE_SINCE=$now
+        fi
     done
+    if [ -f "$FAST" ]; then rm -f "$FAST"; IDLE_SINCE=$((now - IDLE_SEC)); fi   # Vast test finished: don't wait
     for g in "${GPUS[@]}"; do
         if printf '%s\n' "${BUSY[@]}" | grep -qx "$g"; then
             if [ -n "${MPID[$g]}" ] || [ "${LOCKED[$g]}" != 0 ]; then stop_gpu "$g" "GPU in use by Vast/renter"; fi

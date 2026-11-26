@@ -76,7 +76,10 @@ A GPU counts as **busy** if any of these is true:
 
 Extra safety:
 - **Any** `docker create/start` still kills **all** miners and resets **all** clocks immediately,
-  also in `MODE=pergpu`. Idle GPUs are only restarted after `IDLE_SEC` seconds without new events.
+  also in `MODE=pergpu`. Idle GPUs are only restarted after `IDLE_SEC` seconds without new events –
+  except right after one of Vast's own test containers (`vastai/test*`) is destroyed: then they restart
+  immediately. Vast runs its bandwidth test up to ~13 times an hour on an idle machine (~5 s each);
+  this cut the downtime per test from ~22 s to ~7 s.
 - SRBMiner runs with `CUDA_DEVICE_ORDER=PCI_BUS_ID`, so `--gpu-id N` is the same GPU as `nvidia-smi -i N`
   (CUDA's default ordering is "fastest first" and can differ from nvidia-smi).
 - A guard checks every 2 s which GPU each SRBMiner process is actually running on (by PCI bus id).
